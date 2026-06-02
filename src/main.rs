@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,6 +204,10 @@ struct AppState {
     error_count: AtomicU64,
     last_upstream_ok_at: AtomicI64,
     metrics: Mutex<Metrics>,
+    // Transport actually used by the last /dst/sync: 0=none yet, 1=WS, 2=HTTP.
+    // Lets the dashboard show whether we're on the fast WS tunnel or the
+    // HTTP fallback.
+    last_sync_transport: AtomicU8,
 
     // WebSocket tunnel state
     ws_ready: AtomicBool,
@@ -425,6 +429,11 @@ async fn handle(
 
     // Status endpoints — handy for diagnostics without touching upstream.
     if path == "/" || path == "/relay-status" {
+        let transport = match state.last_sync_transport.load(Ordering::SeqCst) {
+            1 => "ws",
+            2 => "http",
+            _ => "none",
+        };
         let body = json!({
             "relay": "DSTP",
             "listening": format!("http://127.0.0.1:{}", state.cfg.port),
@@ -432,6 +441,8 @@ async fn handle(
             "requests": state.request_count.load(Ordering::SeqCst),
             "errors": state.error_count.load(Ordering::SeqCst),
             "lastUpstreamOkAt": state.last_upstream_ok_at.load(Ordering::SeqCst),
+            "wsReady": is_ws_ready(&state),
+            "syncTransport": transport,
         });
         let s = serde_json::to_string_pretty(&body).unwrap_or_default();
         return Ok(Response::builder()
@@ -521,6 +532,11 @@ async fn handle(
         Ok(res) => {
             state.last_upstream_ok_at.store(now_ms(), Ordering::SeqCst);
             state.metrics.lock().await.record(started.elapsed().as_secs_f64() * 1000.0);
+            // A sync that reached here used the HTTP fallback (WS was down or
+            // the WS attempt failed). Mark it so the dashboard can show it.
+            if path == "/api/dst/sync" {
+                state.last_sync_transport.store(2, Ordering::SeqCst); // 2 = HTTP
+            }
             let status = res.status();
             let ct = res
                 .headers()
@@ -612,6 +628,7 @@ async fn try_ws_sync(state: &Arc<AppState>, body_bytes: &Bytes) -> Option<Respon
         }
     };
     state.metrics.lock().await.record(started.elapsed().as_secs_f64() * 1000.0);
+    state.last_sync_transport.store(1, Ordering::SeqCst); // 1 = WS
 
     // Merge + dedupe local (pushed) and remote (drained) commands.
     let mut by_key: HashMap<String, Value> = HashMap::new();
@@ -720,6 +737,7 @@ struct DashSnapshot {
     errs: u64,
     rps: f64,
     ws_up: bool,
+    transport: u8, // 0=nenhum sync ainda, 1=WS, 2=HTTP
     uptime: String,
     last_sync: String,
     stats: LatStats,
@@ -751,11 +769,19 @@ fn draw_dashboard(f: &mut ratatui::Frame, cfg: &Config, s: &DashSnapshot) {
     } else {
         Span::styled("○ OFFLINE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
     };
+    // Transport actually carrying the sync (WS fast tunnel vs HTTP fallback).
+    let transport = match s.transport {
+        1 => Span::styled("WebSocket", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        2 => Span::styled("HTTP (fallback)", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        _ => Span::styled("aguardando", Style::default().fg(Color::DarkGray)),
+    };
     let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("DSTP Relay", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::raw(format!("  ·  127.0.0.1:{}  ·  túnel ", cfg.port)),
             ws,
+            Span::raw("  ·  via "),
+            transport,
         ]),
         Line::from(Span::styled(format!("→ {}", cfg.upstream), Style::default().fg(Color::DarkGray))),
     ])
@@ -882,6 +908,7 @@ fn run_tui(state: Arc<AppState>, cfg: Config) -> std::io::Result<()> {
                 errs,
                 rps,
                 ws_up,
+                transport: state.last_sync_transport.load(Ordering::SeqCst),
                 uptime: fmt_uptime((now - m.started_at) / 1000),
                 last_sync: if last_ok == 0 { "nunca".into() } else { format!("{}s atras", (now - last_ok) / 1000) },
                 stats,
@@ -969,6 +996,7 @@ async fn main() {
         error_count: AtomicU64::new(0),
         last_upstream_ok_at: AtomicI64::new(0),
         metrics: Mutex::new(Metrics::new(now_ms())),
+        last_sync_transport: AtomicU8::new(0),
         ws_ready: AtomicBool::new(false),
         ws_seq: AtomicU64::new(0),
         ws_tx: Mutex::new(None),
