@@ -476,7 +476,10 @@ async fn handle(
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in req_headers.iter() {
         let n = name.as_str().to_ascii_lowercase();
-        if n == "host" || n == "connection" || n == "content-length" {
+        // Strip accept-encoding: let reqwest negotiate + transparently decode
+        // compression. Otherwise the upstream's gzip/br body would be forwarded
+        // compressed and DST's libcurl (which doesn't decode) gets garbage.
+        if n == "host" || n == "connection" || n == "content-length" || n == "accept-encoding" {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
