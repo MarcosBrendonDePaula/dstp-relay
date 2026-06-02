@@ -41,17 +41,30 @@ runtime dependencies — nothing to install.
 
 ## Configuration
 
-Config file `dstp-relay.config.json` next to the binary:
+The relay resolves its upstream/port/token from several sources, **highest
+priority first**:
 
-| Option | Env var | Default | Description |
+1. **Env vars** — `DSTP_UPSTREAM`, `DSTP_PORT`, `DSTP_TOKEN`.
+2. **Local file** — `dstp-relay.config.json` next to the binary (or in CWD).
+3. **Central config from git** — fetched at startup from
+   [`relay-config.json`](./relay-config.json) in this repo. It has a `prod`
+   and a `dev` entry; the relay picks one by `DSTP_ENV` (default: `prod`).
+   Editing that file re-points every relay on its next boot — no recompile.
+4. **Baked defaults** — embedded at build time, used if everything else fails
+   (e.g. no internet at boot).
+
+| Option | Env var | Default (baked) | Description |
 |---|---|---|---|
-| `upstream` | `DSTP_UPSTREAM` | `https://local.marcosbrendon.com` | Central backend URL |
+| `upstream` | `DSTP_UPSTREAM` | `https://dstp.marcosbrendon.com` | Central backend URL |
 | `port` | `DSTP_PORT` | `47834` | Local port to listen on. **Must match the mod's BACKEND_URL port.** |
 | `token` | `DSTP_TOKEN` | `null` | Optional shared secret sent as `X-DSTP-Relay-Token` header |
+| — | `DSTP_ENV` | `prod` | Which entry of the remote config to use (`prod` or `dev`) |
 
-Env vars override the config file. The config file overrides the baked defaults.
-Fields starting with `_` (like `_comment`, `_docs`) are ignored, so you can keep
-notes inline.
+`dev` points the relay at a local backend (`http://localhost:3000`); `prod`
+at the public panel. Run with `DSTP_ENV=dev` while developing.
+
+Fields starting with `_` (like `_comment`) are ignored, so you can keep notes
+inline in any JSON config.
 
 ## Build from source
 

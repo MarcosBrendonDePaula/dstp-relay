@@ -1,0 +1,13 @@
+{
+  "_comment": "Config central do DSTP Relay, buscada do git na inicializacao. O relay escolhe a entry pela env DSTP_ENV (default: prod). Trocar o upstream aqui propaga para todos os relays no proximo boot. Env vars locais (DSTP_UPSTREAM/PORT/TOKEN) e um dstp-relay.config.json ao lado do binario ainda tem prioridade sobre isto.",
+  "prod": {
+    "upstream": "https://dstp.marcosbrendon.com",
+    "port": 47834,
+    "token": null
+  },
+  "dev": {
+    "upstream": "http://localhost:3000",
+    "port": 47834,
+    "token": null
+  }
+}

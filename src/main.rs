@@ -35,10 +35,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 // ─── Baked defaults ─────────────────────────────────────────────────────
 // Edit these before `cargo build --release` to embed your production upstream.
-const BAKED_UPSTREAM: &str = "https://local.marcosbrendon.com";
+const BAKED_UPSTREAM: &str = "https://dstp.marcosbrendon.com";
 // Port 47834 chosen from IANA unassigned range to avoid conflicts with
 // common dev services (Node 3000, Vite 5173, Tomcat 8080, etc).
 const BAKED_PORT: u16 = 47834;
+
+// Central config fetched from git at startup. One JSON with a `prod` and a
+// `dev` entry; the relay picks one by DSTP_ENV (default: prod). Editing this
+// in the repo re-points every relay on its next boot — no recompile.
+const REMOTE_CONFIG_URL: &str =
+    "https://raw.githubusercontent.com/MarcosBrendonDePaula/dstp-relay/main/relay-config.json";
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -57,18 +63,66 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn load_config() -> Config {
+// Overlay a JSON object's upstream/port/token onto an existing Config.
+fn apply_json(cfg: &mut Config, v: &Value) {
+    if let Some(u) = v.get("upstream").and_then(|x| x.as_str()) {
+        if !u.is_empty() {
+            cfg.upstream = u.to_string();
+        }
+    }
+    if let Some(p) = v.get("port").and_then(|x| x.as_u64()) {
+        if p > 0 && p < 65536 {
+            cfg.port = p as u16;
+        }
+    }
+    if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
+        if !t.is_empty() {
+            cfg.token = Some(t.to_string());
+        }
+    }
+}
+
+// Fetch the central config from git and pick the prod/dev entry.
+// Returns None on any failure — the caller falls back to local/baked.
+async fn fetch_remote_config(http: &reqwest::Client, env: &str) -> Option<Value> {
+    let res = http.get(REMOTE_CONFIG_URL).send().await.ok()?;
+    if !res.status().is_success() {
+        return None;
+    }
+    let body = res.text().await.ok()?;
+    let root: Value = serde_json::from_str(&body).ok()?;
+    root.get(env).cloned()
+}
+
+// Config precedence (highest to lowest):
+//   1. env vars DSTP_UPSTREAM / DSTP_PORT / DSTP_TOKEN
+//   2. dstp-relay.config.json next to the binary (or CWD)
+//   3. central config from git, entry chosen by DSTP_ENV (default: prod)
+//   4. baked-in defaults
+async fn load_config(http: &reqwest::Client) -> Config {
+    // Start from baked defaults.
     let mut cfg = Config {
-        upstream: std::env::var("DSTP_UPSTREAM").unwrap_or_else(|_| BAKED_UPSTREAM.to_string()),
-        port: std::env::var("DSTP_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
-            .filter(|p| *p > 0)
-            .unwrap_or(BAKED_PORT),
-        token: std::env::var("DSTP_TOKEN").ok().filter(|s| !s.is_empty()),
+        upstream: BAKED_UPSTREAM.to_string(),
+        port: BAKED_PORT,
+        token: None,
     };
 
-    // Look next to the executable first, then CWD as fallback (dev mode).
+    // (3) Remote git config. DSTP_ENV selects the entry; default "prod".
+    let env = std::env::var("DSTP_ENV").unwrap_or_else(|_| "prod".to_string());
+    match fetch_remote_config(http, &env).await {
+        Some(entry) => {
+            apply_json(&mut cfg, &entry);
+            println!("[relay] Using remote config (env: {}) -> {}", env, cfg.upstream);
+        }
+        None => {
+            eprintln!(
+                "[relay] Remote config unavailable (env: {}), falling back to local/baked",
+                env
+            );
+        }
+    }
+
+    // (2) Local config file next to the binary, then CWD.
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -78,36 +132,35 @@ fn load_config() -> Config {
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("dstp-relay.config.json"));
     }
-
     for path in candidates {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(raw) => match serde_json::from_str::<Value>(&raw) {
                     Ok(v) => {
-                        if let Some(u) = v.get("upstream").and_then(|x| x.as_str()) {
-                            if !u.is_empty() {
-                                cfg.upstream = u.to_string();
-                            }
-                        }
-                        if let Some(p) = v.get("port").and_then(|x| x.as_u64()) {
-                            if p > 0 && p < 65536 {
-                                cfg.port = p as u16;
-                            }
-                        }
-                        if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
-                            if !t.is_empty() {
-                                cfg.token = Some(t.to_string());
-                            }
-                        }
-                        println!("[relay] Using config: {}", path.display());
-                        return cfg;
+                        apply_json(&mut cfg, &v);
+                        println!("[relay] Using local config: {}", path.display());
+                        break;
                     }
-                    Err(e) => eprintln!("[relay] Failed to read {}: {}", path.display(), e),
+                    Err(e) => eprintln!("[relay] Failed to parse {}: {}", path.display(), e),
                 },
                 Err(e) => eprintln!("[relay] Failed to read {}: {}", path.display(), e),
             }
         }
     }
+
+    // (1) Env vars win over everything.
+    if let Ok(u) = std::env::var("DSTP_UPSTREAM") {
+        if !u.is_empty() {
+            cfg.upstream = u;
+        }
+    }
+    if let Some(p) = std::env::var("DSTP_PORT").ok().and_then(|s| s.parse::<u16>().ok()).filter(|p| *p > 0) {
+        cfg.port = p;
+    }
+    if let Some(t) = std::env::var("DSTP_TOKEN").ok().filter(|s| !s.is_empty()) {
+        cfg.token = Some(t);
+    }
+
     cfg
 }
 
@@ -617,7 +670,6 @@ fn banner(cfg: &Config) {
 
 #[tokio::main]
 async fn main() {
-    let cfg = load_config();
     let verbose = std::env::var("DSTP_VERBOSE").ok().as_deref() == Some("1");
     let use_ws = std::env::var("DSTP_USE_WS").ok().as_deref() != Some("0");
 
@@ -626,6 +678,10 @@ async fn main() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to build http client");
+
+    // Resolve config (env > local file > remote git > baked). Uses `http` to
+    // fetch the central config from the dstp-relay repo.
+    let cfg = load_config(&http).await;
 
     let state = Arc::new(AppState {
         cfg: cfg.clone(),
