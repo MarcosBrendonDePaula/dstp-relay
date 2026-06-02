@@ -1,0 +1,12 @@
+{
+  "_comment": "Exemplo de config. Copie para 'dstp-relay.config.json' ao lado do executavel.",
+  "_docs": {
+    "upstream": "URL publica do painel DSTP que voce quer usar",
+    "port": "Porta local onde o relay escuta (o mod DST fala com ela)",
+    "token": "Opcional. Se setado, enviado como header X-DSTP-Relay-Token em toda request"
+  },
+
+  "upstream": "https://local.marcosbrendon.com",
+  "port": 47834,
+  "token": null
+}
