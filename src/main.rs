@@ -672,34 +672,7 @@ async fn try_ws_sync(state: &Arc<AppState>, body_bytes: &Bytes) -> Option<Respon
     )
 }
 
-// ─── Live dashboard ─────────────────────────────────────────────────────
-
-// Unicode bar levels for a compact sparkline.
-const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-// Render a list of values as a sparkline scaled to its own min/max.
-fn sparkline(data: &[f64], width: usize) -> String {
-    if data.is_empty() {
-        return " ".repeat(width);
-    }
-    // Take the last `width` samples.
-    let slice: Vec<f64> = data.iter().rev().take(width).rev().cloned().collect();
-    let min = slice.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = slice.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let range = (max - min).max(1e-9);
-    let mut out = String::new();
-    for v in &slice {
-        let lvl = (((v - min) / range) * (SPARK.len() - 1) as f64).round() as usize;
-        out.push(SPARK[lvl.min(SPARK.len() - 1)]);
-    }
-    // Left-pad if fewer samples than width.
-    if slice.len() < width {
-        let mut padded = " ".repeat(width - slice.len());
-        padded.push_str(&out);
-        return padded;
-    }
-    out
-}
+// ─── Live dashboard (ratatui TUI) ───────────────────────────────────────
 
 struct LatStats {
     avg: f64,
@@ -733,56 +706,211 @@ fn fmt_uptime(secs: i64) -> String {
 }
 
 // A health label for latency variation (jitter).
-fn jitter_label(jitter: f64) -> &'static str {
-    if jitter < 5.0 { "estavel" }
-    else if jitter < 20.0 { "ok" }
-    else if jitter < 50.0 { "instavel" }
-    else { "ruim" }
+fn jitter_label(jitter: f64) -> (&'static str, ratatui::style::Color) {
+    use ratatui::style::Color;
+    if jitter < 5.0 { ("estavel", Color::Green) }
+    else if jitter < 20.0 { ("ok", Color::Green) }
+    else if jitter < 50.0 { ("instavel", Color::Yellow) }
+    else { ("ruim", Color::Red) }
 }
 
-// Inner content width of the box (between the ║ borders, minus the 2 leading
-// spaces of padding used by every line).
-const BOX_W: usize = 60;
-
-// Display width of a string, treating each char as width 1. The box-drawing,
-// arrows and dot glyphs we use are all single-column, so char count == columns.
-fn disp_width(s: &str) -> usize {
-    s.chars().count()
+// Snapshot of everything the dashboard renders, sampled once per tick.
+struct DashSnapshot {
+    reqs: u64,
+    errs: u64,
+    rps: f64,
+    ws_up: bool,
+    uptime: String,
+    last_sync: String,
+    stats: LatStats,
+    history: Vec<(f64, f64)>, // (x, y) points for the latency chart
+    paused: bool,
 }
 
-// Emit one dashboard line, padded to the box width by visual columns.
-fn line(content: &str) {
-    let w = disp_width(content);
-    let pad = BOX_W.saturating_sub(w);
-    println!("║ {}{} ║", content, " ".repeat(pad));
+fn draw_dashboard(f: &mut ratatui::Frame, cfg: &Config, s: &DashSnapshot) {
+    use ratatui::layout::{Constraint, Direction, Layout, Alignment};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+    use ratatui::symbols;
+
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4), // header
+            Constraint::Length(6), // stats
+            Constraint::Min(8),    // latency chart
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    // ── Header ──
+    let ws = if s.ws_up {
+        Span::styled("● ONLINE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("○ OFFLINE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("DSTP Relay", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("  ·  127.0.0.1:{}  ·  túnel ", cfg.port)),
+            ws,
+        ]),
+        Line::from(Span::styled(format!("→ {}", cfg.upstream), Style::default().fg(Color::DarkGray))),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(" relay "));
+    f.render_widget(header, chunks[0]);
+
+    // ── Stats row ──
+    let st = &s.stats;
+    let stats = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Requests  ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}", s.reqs), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("  ·  {:.1} req/s  ·  ", s.rps)),
+            Span::styled(format!("{} err", s.errs), Style::default().fg(if s.errs > 0 { Color::Red } else { Color::DarkGray })),
+        ]),
+        Line::from(vec![
+            Span::styled("Latência  ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{:.0}ms", st.last), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw(format!("  atual  ·  {:.0} média  ·  {:.0} min  ·  {:.0} max", st.avg, st.min, st.max)),
+        ]),
+        Line::from({
+            let (label, color) = jitter_label(st.jitter);
+            vec![
+                Span::styled("Variação  ", Style::default().fg(Color::Gray)),
+                Span::styled(format!("±{:.0}ms ", st.jitter), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("[{}]", label), Style::default().fg(color)),
+                Span::raw(format!("   uptime {}  ·  sync {}", s.uptime, s.last_sync)),
+            ]
+        }),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(" métricas "));
+    f.render_widget(stats, chunks[1]);
+
+    // ── Latency chart ──
+    if s.history.len() >= 2 {
+        let ymax = s.history.iter().map(|(_, y)| *y).fold(0.0_f64, f64::max).max(10.0);
+        let xmax = s.history.last().map(|(x, _)| *x).unwrap_or(1.0);
+        let datasets = vec![Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Cyan))
+            .data(&s.history)];
+        let chart = Chart::new(datasets)
+            .block(Block::default().borders(Borders::ALL).title(" latência upstream (ms) "))
+            .x_axis(Axis::default().style(Style::default().fg(Color::DarkGray)).bounds([0.0, xmax.max(1.0)]))
+            .y_axis(
+                Axis::default()
+                    .style(Style::default().fg(Color::DarkGray))
+                    .labels([
+                        Line::from("0"),
+                        Line::from(format!("{:.0}", ymax / 2.0)),
+                        Line::from(format!("{:.0}", ymax)),
+                    ])
+                    .bounds([0.0, ymax]),
+            );
+        f.render_widget(chart, chunks[2]);
+    } else {
+        let waiting = Paragraph::new("aguardando tráfego…")
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title(" latência upstream (ms) "));
+        f.render_widget(waiting, chunks[2]);
+    }
+
+    // ── Footer ──
+    let hint = if s.paused { "PAUSADO" } else { "ao vivo" };
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled(format!(" {} ", hint), Style::default().fg(if s.paused { Color::Yellow } else { Color::Green })),
+        Span::styled("·  q sair  ·  espaço pausar  ·  c limpar stats", Style::default().fg(Color::DarkGray)),
+    ]));
+    f.render_widget(footer, chunks[3]);
 }
 
-// Redraw the whole dashboard in place (clears screen, moves cursor home).
-fn render_dashboard(cfg: &Config, m: &Metrics, reqs: u64, errs: u64, rps: f64, ws_up: bool, last_ok: i64, now: i64) {
-    let st = lat_stats(&m.latencies);
-    let spark = sparkline(&m.latencies.iter().cloned().collect::<Vec<_>>(), BOX_W - 2);
-    let uptime = fmt_uptime((now - m.started_at) / 1000);
-    let last_sync = if last_ok == 0 { "nunca".to_string() } else { format!("{}s atras", (now - last_ok) / 1000) };
-    let ws = if ws_up { "● UP" } else { "○ DOWN" };
+// Run the interactive dashboard. Owns the terminal until the user presses q
+// (which exits the whole process). Blocking — runs on its own thread.
+fn run_tui(state: Arc<AppState>, cfg: Config) -> std::io::Result<()> {
+    use crossterm::event::{self, Event, KeyCode};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+    use crossterm::execute;
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
 
-    let bar = "═".repeat(BOX_W + 2);
-    print!("\x1b[2J\x1b[H"); // clear screen + cursor home
-    println!("╔{}╗", bar);
-    line(&format!("DSTP Relay · escutando 127.0.0.1:{}", cfg.port));
-    line(&format!("→ {}", cfg.upstream));
-    println!("╠{}╣", bar);
-    line(&format!("Túnel WS  : {}", ws));
-    line(&format!("Uptime    : {}", uptime));
-    line(&format!("Último sync: {}", last_sync));
-    line(&format!("Requests  : {} total · {:.1} req/s · {} err", reqs, rps, errs));
-    println!("╠{}╣", bar);
-    line("Latência upstream (ms)");
-    line(&spark);
-    line(&format!("atual {:.0}  ·  média {:.0}  ·  min {:.0}  ·  max {:.0}", st.last, st.avg, st.min, st.max));
-    line(&format!("variação ±{:.0}ms  [{}]", st.jitter, jitter_label(st.jitter)));
-    println!("╠{}╣", bar);
-    line(&format!("Ctrl+C para sair · {} amostras", st.n));
-    println!("╚{}╝", bar);
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Restore the terminal on the way out, no matter how we leave.
+    let restore = || {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+    };
+
+    let mut paused = false;
+    let mut last_tick = std::time::Instant::now();
+    let tick = Duration::from_millis(1000);
+
+    loop {
+        // Sample state for this frame.
+        let now = now_ms();
+        let reqs = state.request_count.load(Ordering::SeqCst);
+        let errs = state.error_count.load(Ordering::SeqCst);
+        let last_ok = state.last_upstream_ok_at.load(Ordering::SeqCst);
+        let ws_up = is_ws_ready(&state);
+
+        let snapshot = {
+            let mut m = state.metrics.blocking_lock();
+            let dt = ((now - m.last_tick_at) as f64 / 1000.0).max(0.001);
+            let rps = (reqs.saturating_sub(m.last_req_count)) as f64 / dt;
+            if !paused {
+                m.last_req_count = reqs;
+                m.last_tick_at = now;
+            }
+            let stats = lat_stats(&m.latencies);
+            let history: Vec<(f64, f64)> = m
+                .latencies
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i as f64, *v))
+                .collect();
+            DashSnapshot {
+                reqs,
+                errs,
+                rps,
+                ws_up,
+                uptime: fmt_uptime((now - m.started_at) / 1000),
+                last_sync: if last_ok == 0 { "nunca".into() } else { format!("{}s atras", (now - last_ok) / 1000) },
+                stats,
+                history,
+                paused,
+            }
+        };
+
+        terminal.draw(|f| draw_dashboard(f, &cfg, &snapshot))?;
+        last_tick = std::time::Instant::now();
+
+        // Poll keys for up to one tick; redraw when it elapses.
+        if event::poll(tick)? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        restore();
+                        std::process::exit(0);
+                    }
+                    KeyCode::Char(' ') => paused = !paused,
+                    KeyCode::Char('c') => {
+                        let mut m = state.metrics.blocking_lock();
+                        m.latencies.clear();
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 // ─── Banner & heartbeat ─────────────────────────────────────────────────
@@ -854,34 +982,20 @@ async fn main() {
         tokio::spawn(async move { connect_ws(st).await });
     }
 
-    banner(&cfg);
-
-    // Live dashboard, redrawn in place every second. In verbose mode we keep
-    // the scrolling logs instead (the dashboard would fight with them).
+    // Interactive TUI dashboard (ratatui) — flicker-free, keyboard input.
+    // In verbose mode we keep the scrolling logs instead.
     if !verbose {
         let st = state.clone();
         let dcfg = cfg.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            ticker.tick().await; // first tick is immediate; skip it
-            // Give the banner a moment to be read before taking over the screen.
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            loop {
-                ticker.tick().await;
-                let now = now_ms();
-                let reqs = st.request_count.load(Ordering::SeqCst);
-                let errs = st.error_count.load(Ordering::SeqCst);
-                let last_ok = st.last_upstream_ok_at.load(Ordering::SeqCst);
-                let ws_up = is_ws_ready(&st);
-
-                let mut m = st.metrics.lock().await;
-                let dt = ((now - m.last_tick_at) as f64 / 1000.0).max(0.001);
-                let rps = (reqs.saturating_sub(m.last_req_count)) as f64 / dt;
-                m.last_req_count = reqs;
-                m.last_tick_at = now;
-                render_dashboard(&dcfg, &m, reqs, errs, rps, ws_up, last_ok, now);
+        // Run the blocking TUI loop on a dedicated thread (crossterm input +
+        // ratatui draw are sync; we don't want to block the tokio runtime).
+        std::thread::spawn(move || {
+            if let Err(e) = run_tui(st, dcfg) {
+                eprintln!("[relay] dashboard error: {}", e);
             }
         });
+    } else {
+        banner(&cfg);
     }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
