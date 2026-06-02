@@ -733,7 +733,21 @@ async fn main() {
     }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], cfg.port));
-    let listener = TcpListener::bind(addr).await.expect("failed to bind");
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!();
+            eprintln!("[relay] ERRO: a porta {} ja esta em uso.", cfg.port);
+            eprintln!("[relay] Outro relay provavelmente ja esta rodando — feche-o,");
+            eprintln!("[relay] ou rode com outra porta:  DSTP_PORT=47835 dstp-relay");
+            eprintln!();
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("[relay] ERRO ao abrir a porta {}: {}", cfg.port, e);
+            std::process::exit(1);
+        }
+    };
 
     loop {
         let (stream, _) = match listener.accept().await {
