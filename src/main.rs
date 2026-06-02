@@ -166,6 +166,34 @@ async fn load_config(http: &reqwest::Client) -> Config {
 
 // ─── Shared runtime state ───────────────────────────────────────────────
 
+// Rolling latency stats for the live dashboard. Keeps the last N upstream
+// round-trip times (ms) for a sparkline + avg/min/max/jitter.
+const LAT_WINDOW: usize = 60;
+
+struct Metrics {
+    started_at: i64,
+    latencies: std::collections::VecDeque<f64>, // last N request times (ms)
+    last_req_count: u64,                          // for req/s between ticks
+    last_tick_at: i64,
+}
+
+impl Metrics {
+    fn new(now: i64) -> Self {
+        Metrics {
+            started_at: now,
+            latencies: std::collections::VecDeque::with_capacity(LAT_WINDOW),
+            last_req_count: 0,
+            last_tick_at: now,
+        }
+    }
+    fn record(&mut self, ms: f64) {
+        if self.latencies.len() == LAT_WINDOW {
+            self.latencies.pop_front();
+        }
+        self.latencies.push_back(ms);
+    }
+}
+
 struct AppState {
     cfg: Config,
     verbose: bool,
@@ -175,6 +203,7 @@ struct AppState {
     request_count: AtomicU64,
     error_count: AtomicU64,
     last_upstream_ok_at: AtomicI64,
+    metrics: Mutex<Metrics>,
 
     // WebSocket tunnel state
     ws_ready: AtomicBool,
@@ -484,9 +513,11 @@ async fn handle(
     }
 
     // Timeout (10s) is configured on the client; map errors to 502/504.
+    let started = std::time::Instant::now();
     match builder.send().await {
         Ok(res) => {
             state.last_upstream_ok_at.store(now_ms(), Ordering::SeqCst);
+            state.metrics.lock().await.record(started.elapsed().as_secs_f64() * 1000.0);
             let status = res.status();
             let ct = res
                 .headers()
@@ -567,6 +598,7 @@ async fn try_ws_sync(state: &Arc<AppState>, body_bytes: &Bytes) -> Option<Respon
         None => Vec::new(),
     };
 
+    let started = std::time::Instant::now();
     let response = match send_sync_via_ws(state, sync_payload).await {
         Ok(v) => v,
         Err(e) => {
@@ -576,6 +608,7 @@ async fn try_ws_sync(state: &Arc<AppState>, body_bytes: &Bytes) -> Option<Respon
             return None;
         }
     };
+    state.metrics.lock().await.record(started.elapsed().as_secs_f64() * 1000.0);
 
     // Merge + dedupe local (pushed) and remote (drained) commands.
     let mut by_key: HashMap<String, Value> = HashMap::new();
@@ -636,6 +669,119 @@ async fn try_ws_sync(state: &Arc<AppState>, body_bytes: &Bytes) -> Option<Respon
     )
 }
 
+// ─── Live dashboard ─────────────────────────────────────────────────────
+
+// Unicode bar levels for a compact sparkline.
+const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+// Render a list of values as a sparkline scaled to its own min/max.
+fn sparkline(data: &[f64], width: usize) -> String {
+    if data.is_empty() {
+        return " ".repeat(width);
+    }
+    // Take the last `width` samples.
+    let slice: Vec<f64> = data.iter().rev().take(width).rev().cloned().collect();
+    let min = slice.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = slice.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(1e-9);
+    let mut out = String::new();
+    for v in &slice {
+        let lvl = (((v - min) / range) * (SPARK.len() - 1) as f64).round() as usize;
+        out.push(SPARK[lvl.min(SPARK.len() - 1)]);
+    }
+    // Left-pad if fewer samples than width.
+    if slice.len() < width {
+        let mut padded = " ".repeat(width - slice.len());
+        padded.push_str(&out);
+        return padded;
+    }
+    out
+}
+
+struct LatStats {
+    avg: f64,
+    min: f64,
+    max: f64,
+    last: f64,
+    jitter: f64, // mean absolute deviation from avg
+    n: usize,
+}
+
+fn lat_stats(data: &std::collections::VecDeque<f64>) -> LatStats {
+    if data.is_empty() {
+        return LatStats { avg: 0.0, min: 0.0, max: 0.0, last: 0.0, jitter: 0.0, n: 0 };
+    }
+    let n = data.len();
+    let sum: f64 = data.iter().sum();
+    let avg = sum / n as f64;
+    let min = data.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let last = *data.back().unwrap();
+    let jitter = data.iter().map(|v| (v - avg).abs()).sum::<f64>() / n as f64;
+    LatStats { avg, min, max, last, jitter, n }
+}
+
+fn fmt_uptime(secs: i64) -> String {
+    let s = secs.max(0);
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    if h > 0 { format!("{}h{:02}m{:02}s", h, m, sec) }
+    else if m > 0 { format!("{}m{:02}s", m, sec) }
+    else { format!("{}s", sec) }
+}
+
+// A health label for latency variation (jitter).
+fn jitter_label(jitter: f64) -> &'static str {
+    if jitter < 5.0 { "estavel" }
+    else if jitter < 20.0 { "ok" }
+    else if jitter < 50.0 { "instavel" }
+    else { "ruim" }
+}
+
+// Inner content width of the box (between the ║ borders, minus the 2 leading
+// spaces of padding used by every line).
+const BOX_W: usize = 60;
+
+// Display width of a string, treating each char as width 1. The box-drawing,
+// arrows and dot glyphs we use are all single-column, so char count == columns.
+fn disp_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+// Emit one dashboard line, padded to the box width by visual columns.
+fn line(content: &str) {
+    let w = disp_width(content);
+    let pad = BOX_W.saturating_sub(w);
+    println!("║ {}{} ║", content, " ".repeat(pad));
+}
+
+// Redraw the whole dashboard in place (clears screen, moves cursor home).
+fn render_dashboard(cfg: &Config, m: &Metrics, reqs: u64, errs: u64, rps: f64, ws_up: bool, last_ok: i64, now: i64) {
+    let st = lat_stats(&m.latencies);
+    let spark = sparkline(&m.latencies.iter().cloned().collect::<Vec<_>>(), BOX_W - 2);
+    let uptime = fmt_uptime((now - m.started_at) / 1000);
+    let last_sync = if last_ok == 0 { "nunca".to_string() } else { format!("{}s atras", (now - last_ok) / 1000) };
+    let ws = if ws_up { "● UP" } else { "○ DOWN" };
+
+    let bar = "═".repeat(BOX_W + 2);
+    print!("\x1b[2J\x1b[H"); // clear screen + cursor home
+    println!("╔{}╗", bar);
+    line(&format!("DSTP Relay · escutando 127.0.0.1:{}", cfg.port));
+    line(&format!("→ {}", cfg.upstream));
+    println!("╠{}╣", bar);
+    line(&format!("Túnel WS  : {}", ws));
+    line(&format!("Uptime    : {}", uptime));
+    line(&format!("Último sync: {}", last_sync));
+    line(&format!("Requests  : {} total · {:.1} req/s · {} err", reqs, rps, errs));
+    println!("╠{}╣", bar);
+    line("Latência upstream (ms)");
+    line(&spark);
+    line(&format!("atual {:.0}  ·  média {:.0}  ·  min {:.0}  ·  max {:.0}", st.last, st.avg, st.min, st.max));
+    line(&format!("variação ±{:.0}ms  [{}]", st.jitter, jitter_label(st.jitter)));
+    println!("╠{}╣", bar);
+    line(&format!("Ctrl+C para sair · {} amostras", st.n));
+    println!("╚{}╝", bar);
+}
+
 // ─── Banner & heartbeat ─────────────────────────────────────────────────
 
 fn pad(s: &str, w: usize) -> String {
@@ -691,6 +837,7 @@ async fn main() {
         request_count: AtomicU64::new(0),
         error_count: AtomicU64::new(0),
         last_upstream_ok_at: AtomicI64::new(0),
+        metrics: Mutex::new(Metrics::new(now_ms())),
         ws_ready: AtomicBool::new(false),
         ws_seq: AtomicU64::new(0),
         ws_tx: Mutex::new(None),
@@ -706,28 +853,30 @@ async fn main() {
 
     banner(&cfg);
 
-    // Heartbeat status line every 30s.
-    {
+    // Live dashboard, redrawn in place every second. In verbose mode we keep
+    // the scrolling logs instead (the dashboard would fight with them).
+    if !verbose {
         let st = state.clone();
+        let dcfg = cfg.clone();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            ticker.tick().await; // skip immediate first tick
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.tick().await; // first tick is immediate; skip it
+            // Give the banner a moment to be read before taking over the screen.
+            tokio::time::sleep(Duration::from_secs(2)).await;
             loop {
                 ticker.tick().await;
-                let last = st.last_upstream_ok_at.load(Ordering::SeqCst);
-                let status = if last == 0 {
-                    "never connected".to_string()
-                } else {
-                    format!("last success {}s ago", (now_ms() - last) / 1000)
-                };
-                let ws_status = if is_ws_ready(&st) { "WS up" } else { "WS down" };
-                println!(
-                    "[relay] {} req, {} err, {}, upstream: {}",
-                    st.request_count.load(Ordering::SeqCst),
-                    st.error_count.load(Ordering::SeqCst),
-                    ws_status,
-                    status
-                );
+                let now = now_ms();
+                let reqs = st.request_count.load(Ordering::SeqCst);
+                let errs = st.error_count.load(Ordering::SeqCst);
+                let last_ok = st.last_upstream_ok_at.load(Ordering::SeqCst);
+                let ws_up = is_ws_ready(&st);
+
+                let mut m = st.metrics.lock().await;
+                let dt = ((now - m.last_tick_at) as f64 / 1000.0).max(0.001);
+                let rps = (reqs.saturating_sub(m.last_req_count)) as f64 / dt;
+                m.last_req_count = reqs;
+                m.last_tick_at = now;
+                render_dashboard(&dcfg, &m, reqs, errs, rps, ws_up, last_ok, now);
             }
         });
     }
